@@ -1,0 +1,133 @@
+# Jeket's build of Shaka Player (Jeket-com/JSS#1560).
+#
+# One player for JSS, JBS and the website: the experimental bundle (MoQ/MSF,
+# HLS, DASH) built from a jeket/* branch, published as the package
+# @jeket-cloud/shaka-player in a GitHub release. Consumers depend on the
+# release asset's URL; the fork is public, so no registry credentials.
+#
+#   push / pull request on jeket/*   build, pack, run the tests in Chrome
+#   tag v<upstream>-jeket.<n>        the same, then the release with the package
+#
+# Upstream's own workflows stay in the tree untouched (they trigger on main and
+# v[0-9]* branches only), so merging a newer upstream release stays simple.
+name: Jeket build, test and release
+
+on:
+  push:
+    branches: ['jeket/**']
+    tags: ['v*-jeket.*']
+  pull_request:
+    branches: ['jeket/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jeket-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: Build and pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Build the experimental bundles
+        timeout-minutes: 25
+        run: |
+          npm ci
+          python3 build/gendeps.py
+          python3 build/build.py --name experimental +@complete --force
+          python3 build/build.py --name experimental --debug +@complete --force
+
+      - name: Pack @jeket-cloud/shaka-player
+        run: node jeket/pack.mjs
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: jeket-package
+          path: jeket/out/*.tgz
+          if-no-files-found: error
+
+  test:
+    name: Test in Chrome (uncompiled, so MSF is covered)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 21
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Test
+        timeout-minutes: 40
+        run: |
+          python3 build/test.py \
+            --uncompiled \
+            --browsers Chrome \
+            --use-xvfb --running_in_vm \
+            --reporters spec --spec-hide-passed
+
+  release:
+    name: Release
+    if: github.ref_type == 'tag'
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: jeket-package
+          path: out
+
+      - name: Publish the package as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          tgz=$(ls out/*.tgz)
+          name=$(basename "$tgz")
+          integrity="sha512-$(openssl dgst -sha512 -binary "$tgz" | base64 -w0)"
+          pin=$(tar -xOzf "$tgz" package/PIN.json)
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${name}"
+          {
+            echo "Jeket's build of Shaka Player: the experimental bundle (MoQ/MSF, HLS, DASH) as \`@jeket-cloud/shaka-player\`."
+            echo
+            echo "Install:"
+            echo
+            echo '```json'
+            echo "\"@jeket-cloud/shaka-player\": \"${url}\""
+            echo '```'
+            echo
+            echo "npm integrity: \`${integrity}\`"
+            echo
+            echo "Build pin:"
+            echo
+            echo '```json'
+            echo "$pin"
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" "$tgz" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md
